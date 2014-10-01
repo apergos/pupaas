@@ -8,12 +8,32 @@ import getopt
 import fcntl
 import socket
 import struct
+import traceback
 
 # TODO
 # test all error conditions
 # document
 
 VERSION = "0.1"
+
+# for python 2.6, e.g. lucid
+# source: http://stackoverflow.com/questions/4814970/subprocess-check-output-doesnt-seem-to-exist-python-2-6-5
+# code is actually a backport from python 2.7
+if "check_output" not in dir( subprocess ): # duck punch it in!
+    def f(*popenargs, **kwargs):
+        if 'stdout' in kwargs:
+            raise ValueError('stdout argument not allowed, it will be overridden.')
+        process = subprocess.Popen(stdout=subprocess.PIPE, *popenargs, **kwargs)
+        output, unused_err = process.communicate()
+        retcode = process.poll()
+        if retcode:
+            cmd = kwargs.get("args")
+            if cmd is None:
+                cmd = popenargs[0]
+            raise subprocess.CalledProcessError(retcode, cmd)
+        return output
+    subprocess.check_output = f
+
 
 class PupServer(BaseHTTPServer.HTTPServer, object):
     def __init__(self, options):
@@ -139,6 +159,15 @@ class PupRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler, object):
         try:
             result = subprocess.check_output(command)
         except:
+            if self.server.logging is None:
+                fd = sys.stderr
+            else:
+                f = os.open(self.server.logging, os.O_WRONLY | os.O_APPEND | os.O_CREAT )
+                fd = os.fdopen(f,"a")
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            traceback.print_exc(fd)
+            if fd != sys.stderr:
+                fd.close()
             self.send_error(500)
             return
         
