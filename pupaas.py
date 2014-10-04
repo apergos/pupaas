@@ -14,12 +14,13 @@ import traceback
 # test all error conditions
 # document
 
-VERSION = "0.1"
+VERSION = "0.1.1"
 
 # for python 2.6, e.g. lucid
-# source: http://stackoverflow.com/questions/4814970/subprocess-check-output-doesnt-seem-to-exist-python-2-6-5
+# source:
+# http://stackoverflow.com/questions/4814970/subprocess-check-output-doesnt-seem-to-exist-python-2-6-5
 # code is actually a backport from python 2.7
-if "check_output" not in dir( subprocess ): # duck punch it in!
+if "check_output" not in dir(subprocess): # duck punch it in!
     def f(*popenargs, **kwargs):
         if 'stdout' in kwargs:
             raise ValueError('stdout argument not allowed, it will be overridden.')
@@ -36,7 +37,16 @@ if "check_output" not in dir( subprocess ): # duck punch it in!
 
 
 class PupServer(BaseHTTPServer.HTTPServer, object):
+    """
+    http server with workaround for gethostbyname
+    failures, logging options, and a new attribute
+    'manifest_base' which tells us the path to
+    the puppet manifest tree
+    """
+
     def __init__(self, options):
+        'constructor'
+
         s_name = options['server']
         if not s_name:
             s_name = socket.gethostname()
@@ -44,80 +54,70 @@ class PupServer(BaseHTTPServer.HTTPServer, object):
                 try:
                     s_name = socket.gethostbyname(s_name)
                 except socket.gaierror:
-                    s_name = self.get_ip(options['iface'])
+                    s_name = get_ip(options['iface'])
 
-        super( PupServer, self ).__init__((s_name, int(options['port'])),PupRequestHandler)
+        super(PupServer, self).__init__((s_name, int(options['port'])),
+                                        PupRequestHandler)
         self.manifest_base = options['manifests']
         self.logging = options['logging']
 
-    def get_ip(self, ifname):
-        # hack to work around python broken getaddrinfo/gethostbyname
-        # when presented with names like 836937931829
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        return socket.inet_ntoa(fcntl.ioctl(
-            s.fileno(),
-            0x8915,  # SIOCGIFADDR
-            struct.pack('256s', ifname[:15])
-        )[20:24])
 
 class PupRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler, object):
     server_version = 'PUPAAS/' + VERSION
     BUF_SIZE = 65536
 
-    def log_error(self, format, *args):
-        if self.server.logging != "stderr":
-            fd = None
-            try:
-                f = os.open(self.server.logging, os.O_WRONLY | os.O_APPEND | os.O_CREAT )
-                fd = os.fdopen(f,"a")
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            except:
-                if fd:
-                    fd.close()
-                fd = sys.stderr
-        else:
-            fd = sys.stderr
+    def log_error(self, formatstr, *args):
+        'log errors to the logfile or stderr if there is no logfile'
 
-        fd.write("%s - - [%s] %s\n" % (self.client_address[0], self.log_date_time_string(),
-                                       format%args))
-        if fd != sys.stderr:
-            fd.close()
+        filedesc = get_log_filedesc(self.server.logging)
+
+        filedesc.write("%s - - [%s] %s\n" % (self.client_address[0],
+                                             self.log_date_time_string(),
+                                             formatstr%args))
+        if filedesc != sys.stderr:
+            filedesc.close()
 
     def log_request(self, code='-', size='-'):
+        "don't log requests"
+
         pass
 
     def get_manifest_path(self, path):
-        return '/'.join([self.server.manifest_base.rstrip('/'),path.lstrip('/')])
+        'construct the full path to a manifest'
 
-    def check_path(self,path):
-        # check that it ends in pp and that the rest is only ascii alphanumeric with '/' or - or _
-        if not path.endswith(".pp"):
-            return False
-        if not re.match("^[a-zA-Z0-9_\-/]+$",path[:-3]):
-            return False
-        return True
+        return '/'.join([self.server.manifest_base.rstrip('/'),
+                         path.lstrip('/')])
 
     def do_GET(self):
-        # expect '/manifest/...' or '/fact/...')
+        """
+        handle GET requests
+        expect '/manifest/...' or '/fact/...'
+        """
+
         if self.path[0] != '/':
             self.send_error(403)
             return
-            
+
         path = self.path[1:]
         if not '/' in path:
             self.send_error(403)
             return
 
-        subcommand, rest = path.split('/',1)
+        subcommand, rest = path.split('/', 1)
         if subcommand == 'manifest':
             self.get_manifest(rest)
         elif subcommand == 'fact':
             self.get_fact(rest)
         else:
             self.send_error(403)
-            
+
     def get_manifest(self, path):
-        if not self.check_path(self.path):
+        """
+        get the contents of a manifest
+        and return them to the http client
+        """
+
+        if not check_manifest_path(self.path):
             self.send_error(403)
             return
 
@@ -126,51 +126,47 @@ class PupRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler, object):
         if not os.path.exists(manifest_path):
             self.send_error(404)
             return
-            
-        fd = None
+
+        filehandle = None
         try:
-            fd = open(manifest_path, "r")
+            filehandle = open(manifest_path, "r")
         except:
             # note that if we can't open it that's still considered
             # server issues rather than 403, since it's in the manifest dir
-            if fd:
-                fd.close()
+            if filehandle:
+                filehandle.close()
+            log_traceback(self.server.logging)
             self.send_error(500)
             return
 
-        file_info = os.fstat(fd.fileno())
+        file_info = os.fstat(filehandle.fileno())
         self.send_response(200)
-        self.send_header('Last-modified', self.date_time_string(file_info.st_mtime))
+        self.send_header('Last-modified',
+                         self.date_time_string(file_info.st_mtime))
         self.send_header('Content-type', 'text/plain')
         if self.command == 'GET':
-            self.send_header('Content-length',file_info.st_size)
+            self.send_header('Content-length', file_info.st_size)
         self.end_headers()
 
         if self.command == 'GET':
-            contents = fd.read(PupRequestHandler.BUF_SIZE)
-            while (contents):
+            contents = filehandle.read(PupRequestHandler.BUF_SIZE)
+            while contents:
                 self.wfile.write(contents)
-                contents = fd.read(PupRequestHandler.BUF_SIZE)
+                contents = filehandle.read(PupRequestHandler.BUF_SIZE)
 
-        fd.close()
+        filehandle.close()
 
     def get_fact(self, path):
-        command = [ '/usr/bin/facter', path ]
+        'get and return the value of a facter fact'
+
+        command = ['/usr/bin/facter', path]
         try:
             result = subprocess.check_output(command)
         except:
-            if self.server.logging is None:
-                fd = sys.stderr
-            else:
-                f = os.open(self.server.logging, os.O_WRONLY | os.O_APPEND | os.O_CREAT )
-                fd = os.fdopen(f,"a")
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            traceback.print_exc(fd)
-            if fd != sys.stderr:
-                fd.close()
+            log_traceback(self.server.logging)
             self.send_error(500)
             return
-        
+
         if not result:
             self.send_error(404)
             return
@@ -179,7 +175,7 @@ class PupRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler, object):
         self.send_header('Last-modified', self.date_time_string(time.time()))
         self.send_header('Content-type', 'text/plain')
         if self.command == 'GET':
-            self.send_header('Content-length',len(result))
+            self.send_header('Content-length', len(result))
         self.end_headers()
 
         if self.command == 'GET':
@@ -188,23 +184,35 @@ class PupRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler, object):
     do_HEAD = do_GET
 
     def do_PUT(self):
+        """
+        handle PUT requests
+        these should be put of a manifest,
+        nothing else is currently supported
+        """
+
         if self.path[0] != '/':
             self.send_error(403)
             return
-            
+
         path = self.path[1:]
         if not '/' in path:
             self.send_error(403)
             return
 
-        subcommand, rest = path.split('/',1)
+        subcommand, rest = path.split('/', 1)
         if subcommand == 'manifest':
             self.put_manifest(rest)
         else:
             self.send_error(403)
 
     def put_manifest(self, path):
-        if not self.check_path(path):
+        """
+        read contents of a manifest from the
+        http client and save them into the specified
+        location
+        """
+
+        if not check_manifest_path(path):
             self.send_error(403)
             return
 
@@ -215,33 +223,43 @@ class PupRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler, object):
             self.send_error(403)
             return
 
-        f = None
+        filehandle = None
         try:
-            f = os.open(manifest_path,os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            filehandle = os.open(manifest_path,
+                                 os.O_WRONLY |
+                                 os.O_CREAT |
+                                 os.O_EXCL)
         except:
+            log_traceback(self.server.logging)
             self.send_error(500)
-            if f:
-                f.close()
+            if filehandle:
+                filehandle.close()
             return
-        fd = os.fdopen(f,"w")
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        filehandle = os.fdopen(f, "w")
+        fcntl.flock(filehandle, fcntl.LOCK_EX)
 
         # FIXME what server headers are required for PUT?
         if 'content-length' in self.headers:
-            self.process_client_data(fd,int(self.headers['content-length']))
+            self.process_client_data(filehandle,
+                                     int(self.headers['content-length']))
         else:
-            self.process_client_data(fd)
+            self.process_client_data(filehandle)
 
-        fd.close()
+        filehandle.close()
         self.send_response(201)
         self.send_header('Content-length', '0')
         self.end_headers()
 
-    def process_client_data(self, fd, max_bytes=None):
+    def process_client_data(self, filehandle, max_bytes=None):
+        """
+        read client PUT data and write it out to the open file,
+        one buffer at a time
+        """
+
         if max_bytes is None:
             contents = self.rfile.read(PupRequestHandler.BUF_SIZE)
-            while (contents):
-                fd.write(contents)
+            while contents:
+                filehandle.write(contents)
                 contents = self.rfile.read(PupRequestHandler.BUF_SIZE)
             return
 
@@ -251,38 +269,54 @@ class PupRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler, object):
         contents = self.read_chunk(remaining)
         bytes_read = bytes_read + len(contents)
         remaining = remaining - len(contents)
-        while (contents):
-            fd.write(contents)
+        while contents:
+            filehandle.write(contents)
             if not remaining:
                 break
-            contents = read_chunk(remaining)
+            contents = self.read_chunk(remaining)
             bytes_read = bytes_read + len(contents)
             remaining = remaining - len(contents)
 
     def read_chunk(self, remaining):
+        'read up to a bufferful of data from the client'
+
         if remaining < PupRequestHandler.BUF_SIZE:
             return self.rfile.read(remaining)
         else:
             return self.rfile.read(PupRequestHandler.BUF_SIZE)
 
     def do_POST(self):
+        """
+        'handle POST requests
+        these should be requests to apply
+        a given manifest, no other requests
+        are currently supported
+        """
+
         if self.path[0] != '/':
             self.send_error(403)
             return
-            
+
         path = self.path[1:]
         if not '/' in path:
             self.send_error(403)
             return
 
-        subcommand, rest = path.split('/',1)
+        subcommand, rest = path.split('/', 1)
         if subcommand == 'apply':
             self.apply_manifest(rest)
         else:
             self.send_error(403)
 
     def apply_manifest(self, path):
-        if not self.check_path(self.path):
+        """
+        puppet apply an existing manifest
+        and return 200 on successful apply
+        with change, 204 on success with no change,
+        or error status code depending on the error
+        """
+
+        if not check_manifest_path(self.path):
             self.send_error(403)
             return
 
@@ -291,50 +325,69 @@ class PupRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler, object):
         if not os.path.exists(manifest_path):
             self.send_error(404)
             return
-        
+
         # run the command, get error output if any
-        command = [ "/usr/bin/puppet", "apply", "--detailed-exitcodes", manifest_path ]
-        proc = subprocess.Popen(command, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        command = ["/usr/bin/puppet", "apply", "--detailed-exitcodes",
+                   manifest_path]
+        proc = subprocess.Popen(command, stderr=subprocess.PIPE,
+                                stdout=subprocess.PIPE)
         try:
             stdoutdata, stderrdata = proc.communicate()
         except:
+            log_traceback(self.server.logging)
             self.send_error(500)
             return
         if proc.returncode == 4 or proc.returncode == 6:
             # fixme should really send contents of stderr + possibly stdout here
+            log_traceback(self.server.logging)
             self.send_error(500)
             return
         elif proc.returncode == 2:
             # something changed, should show it to the user
             self.send_response(200)
-            self.send_header('Last-modified', self.date_time_string(time.time()))
+            self.send_header('Last-modified',
+                             self.date_time_string(time.time()))
             self.send_header('Content-type', 'text/plain')
-            self.send_header('Content-length',len(stdoutdata))
+            self.send_header('Content-length', len(stdoutdata))
             self.end_headers()
             self.wfile.write(stdoutdata)
         elif proc.returncode == 0:
             self.send_response(204)
-            self.send_header('Last-modified', self.date_time_string(time.time()))
+            self.send_header('Last-modified',
+                             self.date_time_string(time.time()))
             self.end_headers()
 
     def do_DELETE(self):
+        """
+        handle DELETE requests
+        these should be requests to delete a
+        manifest; no other requests are currently
+        supported
+        """
+
         if self.path[0] != '/':
             self.send_error(403)
             return
-            
+
         path = self.path[1:]
         if not '/' in path:
             self.send_error(403)
             return
 
-        subcommand, rest = path.split('/',1)
+        subcommand, rest = path.split('/', 1)
         if subcommand == 'manifest':
             self.delete_manifest(rest)
         else:
             self.send_error(403)
 
     def delete_manifest(self, path):
-        if not self.check_path(self.path):
+        """
+        delete a manifest and return 204 on
+        success or an error code depending
+        on the error
+        """
+
+        if not check_manifest_path(self.path):
             self.send_error(403)
             return
 
@@ -343,7 +396,7 @@ class PupRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler, object):
         if not os.path.exists(manifest_path):
             self.send_error(404)
             return
-            
+
         # yes there is a race here, maybe something
         # else removed it. that's life.
         try:
@@ -351,21 +404,83 @@ class PupRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler, object):
         except:
             # note that if we don't have perms that's still considered
             # server issues rather than 403, since it's in the manifest dir
+            log_traceback(self.server.logging)
             self.send_error(500)
             return
 
         self.send_response(204)
         self.send_header('Last-modified', self.date_time_string(time.time()))
         self.end_headers()
-        
+
     def do_CONNECT(self):
+        'let the base class handle connects'
         pass
 
+
+def check_manifest_path(path):
+    """
+    check that manifest path ends in pp and that the rest is
+    only ascii alphanumeric with '/' or - or _
+    """
+    if not path.endswith(".pp"):
+        return False
+    if not re.match("^[a-zA-Z0-9_\-/]+$", path[:-3]):
+        return False
+    return True
+
+def get_ip(ifname):
+    """
+    hack to work around python broken getaddrinfo/gethostbyname
+    when presented with names like 836937931829
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    return socket.inet_ntoa(fcntl.ioctl(
+        sock.fileno(),
+        0x8915,  # SIOCGIFADDR
+        struct.pack('256s', ifname[:15])
+    )[20:24])
+
+def get_log_filedesc(logfile):
+    if logfile != "stderr":
+        filedesc = None
+        try:
+            filehandle = os.open(logfile,
+                                 os.O_WRONLY |
+                                 os.O_APPEND |
+                                 os.O_CREAT)
+            filedesc = os.fdopen(f, "a")
+            fcntl.flock(filedesc, fcntl.LOCK_EX)
+        except:
+            if filedesc:
+                filehandle.close()
+            filedesc = sys.stderr
+    else:
+        filedesc = sys.stderr
+    return filedesc
+
+def log_traceback(logfile):
+    """
+    write traceback from exception to the
+    log file or, if there is none, to stderr
+    """
+    filedesc = get_log_filedesc(logfile)
+
+    traceback.print_exc(filedesc)
+    if filedesc != sys.stderr:
+        filedesc.close()
+
 def show_version():
+    'display the version of this script'
+
     print "pupaas.py " + VERSION + "\n"
     sys.exit(0)
 
-def usage(message = None):
+def usage(message=None):
+    """
+    display a helpful usage message, with optional
+    introductory text if desired
+    """
+
     if message is not None:
         sys.stderr.write(message)
         sys.stderr.write("\n")
@@ -407,6 +522,12 @@ Confile file format:
     sys.exit(1)
 
 def opts_merge(defaults, configvals, cmdlinevals):
+    """
+    merge in options read from the command line,
+    config file options and defaults, in that
+    order of precedence
+    """
+
     result = {}
     for name in cmdlinevals:
         result[name] = cmdlinevals[name]
@@ -419,23 +540,25 @@ def opts_merge(defaults, configvals, cmdlinevals):
     return result
 
 def get_config(config_file, defaultpath):
+    'read and stash options from config file'
+
     result = {}
     if not config_file:
         config_file = defaultpath
-    fd = None
+    filehandle = None
     try:
-        fd = open(config_file,"r")
+        filehandle = open(config_file, "r")
     except:
         if config_file == defaultpath:
-            if fd:
-                fd.close()
+            if filehandle:
+                filehandle.close()
             return result
         else:
             raise
 
     errors = False
     # format: name=value (maybe blanks around equals sign)
-    for line in fd:
+    for line in filehandle:
         line = line.rstrip('\n')
         if (not line) or line.startswith('#'):
             continue
@@ -457,62 +580,90 @@ def get_config(config_file, defaultpath):
     return result
 
 def do_fork():
+    """
+    fork, exiting the parent process and leaving the
+    child running
+    """
+
     try:
         pid = os.fork()
         if pid > 0:
             sys.exit(0)
-    except OSError, e:
-        sys.stderr.write("fork failed: %d (%s)\n" % (e.errno, e.strerror))
+    except OSError, err:
+        sys.stderr.write("fork failed: %d (%s)\n" % (err.errno,
+                                                     err.strerror))
         sys.exit(1)
 
 def be_daemon():
+    'do the daemon fork/setsid song and dance'
+
     do_fork()      # so child can be process leader
     os.setsid()    # new session with no controlling terminal
-    do_fork()      # process leader exists, child can't get a controlling terminal
+    do_fork()      # process leader exists, child can't get a controlling term
     os.chdir("/")  # only root filesystem kept in use
     os.umask(0)    # ditch any inherited umask
 
-if __name__ == '__main__':
-    defaults = { 'port': '8001', 'manifests': '/etc/puppet', 'logging': '/var/log/pupaas_errors', 'server': None, 'iface': 'eth0' }
-    args = {}
-    default_config_file = '/etc/pupaas/pupaas.conf'
-    config_file = None
+def process_options(options):
+    """
+    stuff options into a nice dict, return them
+    along with the config_file name if any
+    """
 
-    try:
-        (options, remainder) = getopt.gnu_getopt(sys.argv[1:], "c:l:m:p:vh", ["config=","logging=", "manifests=", "port=","server=", "iface=", "version","help"])
-    except getopt.GetoptError as err:
-        usage("Unknown option specified: " + str(err))
+    args = {}
+    config_file = None
     for (opt, val) in options:
         if opt in ["-c", "--config"]:
             config_file = val
-        elif opt in ["-l", "--logging" ]:
+        elif opt in ["-l", "--logging"]:
             args['logging'] = val
-        elif opt in ["-m", "--manifests" ]:
-            if not re.match("^[a-zA-Z0-9/]+$",val):
+        elif opt in ["-m", "--manifests"]:
+            if not re.match("^[a-zA-Z0-9/]+$", val):
                 usage("manifest path must be alphanumeric with /")
             args['manifests'] = val
-        elif opt in ["-p", "--port" ]:
+        elif opt in ["-p", "--port"]:
             if not val.isdigit():
                 usage("port must be a number")
             args['port'] = val
-        elif opt in ["-s", "--server" ]:
+        elif opt in ["-s", "--server"]:
             args['server'] = val
-        elif opt in ["-s", "--iface" ]:
+        elif opt in ["-s", "--iface"]:
             args['iface'] = val
-        elif opt in ["-v", "--version" ]:
+        elif opt in ["-v", "--version"]:
             show_version()
-        elif opt in ["h", "--help" ]:
+        elif opt in ["h", "--help"]:
             usage()
         else:
             usage("Unknown option specified: %s" % opt)
+    return config_file, args
+
+def main():
+    'do all the work, main entry point'
+
+    defaults = {'port': '8001', 'manifests': '/etc/puppet',
+                'logging': '/var/log/pupaas_errors',
+                'server': None, 'iface': 'eth0'}
+    default_config_file = '/etc/pupaas/pupaas.conf'
+
+    try:
+        (options, remainder) = getopt.gnu_getopt(
+            sys.argv[1:], "c:l:m:p:vh", ["config=", "logging=",
+                                         "manifests=", "port=",
+                                         "server=", "iface=",
+                                         "version", "help"])
+    except getopt.GetoptError as err:
+        usage("Unknown option specified: " + str(err))
 
     if len(remainder) > 0:
         usage("Unknown option(s) specified: <%s>" % remainder[0])
 
+    config_file, args = process_options(options)
     configs = get_config(config_file, default_config_file)
     options = opts_merge(defaults, configs, args)
 
     be_daemon()
-    ps = PupServer(options)
-    while (True):
-        ps.handle_request()
+    puppet = PupServer(options)
+    while True:
+        puppet.handle_request()
+
+if __name__ == '__main__':
+    main()
