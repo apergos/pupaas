@@ -235,17 +235,17 @@ class PupRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler, object):
             if filehandle:
                 filehandle.close()
             return
-        filehandle = os.fdopen(f, "w")
-        fcntl.flock(filehandle, fcntl.LOCK_EX)
+        filedesc = os.fdopen(filehandle, "w")
+        fcntl.flock(filedesc, fcntl.LOCK_EX)
 
         # FIXME what server headers are required for PUT?
         if 'content-length' in self.headers:
-            self.process_client_data(filehandle,
+            self.process_client_data(filedesc,
                                      int(self.headers['content-length']))
         else:
-            self.process_client_data(filehandle)
+            self.process_client_data(filedesc)
 
-        filehandle.close()
+        filedesc.close()
         self.send_response(201)
         self.send_header('Content-length', '0')
         self.end_headers()
@@ -448,7 +448,7 @@ def get_log_filedesc(logfile):
                                  os.O_WRONLY |
                                  os.O_APPEND |
                                  os.O_CREAT)
-            filedesc = os.fdopen(f, "a")
+            filedesc = os.fdopen(filehandle, "a")
             fcntl.flock(filedesc, fcntl.LOCK_EX)
         except:
             if filedesc:
